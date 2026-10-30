@@ -10,16 +10,18 @@
   body{margin:0;background:#fff;color:#3c3c3c;overflow:hidden;
     font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;}
   :root{
+    /* 安全区：优先 env()，WKWebView 返回 0 时由 JS 兜底改写 */
+    --sat:env(safe-area-inset-top,0px);--sab:env(safe-area-inset-bottom,0px);
     --green:#58cc02;--green-d:#46a302;--green-l:#d7ffb8;
     --red:#ff4b4b;--red-d:#e02c2c;--red-l:#ffdfe0;
     --blue:#1cb0f6;--blue-d:#1899d6;--blue-l:#ddf4ff;
     --gold:#ffb020;--gold-d:#e0a020;--gold-l:#fff9e6;--gold-b:#ffe4a1;
     --gray:#e5e5e5;--gray-t:#afafaf;
   }
-  #app{max-width:480px;margin:0 auto;height:100%;position:relative;overflow:hidden;
-    /* iOS App 全屏外壳：避让刘海/灵动岛/底部横条 */
-    padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);}
-  .screen{position:absolute;inset:0;display:none;flex-direction:column;padding:16px;}
+  #app{max-width:480px;margin:0 auto;height:100%;position:relative;overflow:hidden;}
+  /* 注意：absolute 子元素的包含块是 padding box，安全区必须加在 .screen 上才生效 */
+  .screen{position:absolute;inset:0;display:none;flex-direction:column;
+    padding:calc(var(--sat) + 12px) 16px calc(var(--sab) + 12px);}
   .screen.active{display:flex;animation:fadeIn .25s ease;}
   @keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
 
@@ -76,7 +78,7 @@
 
   /* 图片裁切页（拍完先框出要识别的区域） */
   .crop-page{position:fixed;inset:0;z-index:120;background:#101014;display:none;flex-direction:column;
-    padding:calc(env(safe-area-inset-top,0px) + 8px) 12px calc(env(safe-area-inset-bottom,0px) + 10px);}
+    padding:calc(var(--sat) + 8px) 12px calc(var(--sab) + 10px);}
   .crop-page.show{display:flex;}
   .crop-top{display:flex;align-items:center;gap:8px;padding:2px 0 10px;}
   .crop-top .icon-btn{color:#fff;font-size:24px;line-height:1;}
@@ -548,8 +550,11 @@
 /* =========================================================
    0. 版本
    ========================================================= */
-const APP_VERSION = '1.13.3';
+const APP_VERSION = '1.13.4';
 const VERSION_LOG = [
+  { version: '1.13.4', date: '2026-10-30', items: [
+    '修好顶部被刘海/灵动岛挡住：安全区原来加错了容器，没生效'
+  ] },
   { version: '1.13.3', date: '2026-10-30', items: [
     '朗读换成在线发音：有道美音 → 有道英音 → 百度 → 系统语音，一个不行自动换下一个',
     '修好了「有些单词点了喇叭不出声」：原来是手机系统语音不稳定，现在不再依赖它',
@@ -2648,6 +2653,25 @@ resetHome();
 updatePointsDisplay();
 renderLogsList();
 checkNicknameOnStart();
+
+/* 安全区兜底：iOS WKWebView 里 env(safe-area-inset-*) 常返回 0，
+   此时按屏幕高度估算刘海/灵动岛高度，写回 --sat / --sab */
+(function fixSafeArea(){
+  function probe(name){
+    var d=document.createElement('div');
+    d.style.cssText='position:fixed;top:0;left:0;width:0;height:env('+name+',0px);visibility:hidden;pointer-events:none';
+    document.body.appendChild(d);
+    var h=parseFloat(getComputedStyle(d).height)||0;
+    d.parentNode.removeChild(d);
+    return h;
+  }
+  var sat=probe('safe-area-inset-top'), sab=probe('safe-area-inset-bottom');
+  var H=Math.max(window.screen.width,window.screen.height);
+  if(sat<1){ sat = H>=852 ? 59 : H>=812 ? 47 : 20; }
+  if(sab<1){ sab = H>=812 ? 34 : 0; }
+  document.documentElement.style.setProperty('--sat',sat+'px');
+  document.documentElement.style.setProperty('--sab',sab+'px');
+})();
 </script>
 </body>
 </html>
