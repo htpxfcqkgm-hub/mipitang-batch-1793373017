@@ -2,6 +2,8 @@ import SwiftUI
 import UIKit
 import WebKit
 import CryptoKit
+import AVFoundation
+import PhotosUI
 
 // MARK: - 网页开关偏好（震动 / 自动更新）
 
@@ -309,6 +311,8 @@ struct WebView: UIViewRepresentable {
 
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
+        // 关键：没有 uiDelegate，网页里的 <input type=file> 和 alert/confirm 全是哑的
+        webView.uiDelegate = context.coordinator.uiDelegate
         context.coordinator.webView = webView
         context.coordinator.bridge = bridge
         bridge.webView = webView
@@ -342,6 +346,7 @@ struct WebView: UIViewRepresentable {
         uiView.configuration.userContentController.removeScriptMessageHandler(forName: "haptic")
         uiView.configuration.userContentController.removeScriptMessageHandler(forName: "settings")
         uiView.navigationDelegate = nil
+        uiView.uiDelegate = nil
         coordinator.webView = nil
         coordinator.bridge?.webView = nil
     }
@@ -352,6 +357,7 @@ struct WebView: UIViewRepresentable {
         weak var bridge: WebBridge?
         let haptic = HapticBridge()
         let settings = SettingsBridge()
+        let uiDelegate = WebUIDelegate()
 
         /// 公告地址（v1.3：优先 Cloudflare Worker，失败自动换 GitHub 直连）
         private let noticeURLs = [
@@ -778,5 +784,236 @@ struct WebView: UIViewRepresentable {
         private static func sha256Hex(_ data: Data) -> String {
             return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         }
+    }
+}
+
+// MARK: - 网页交互补齐（相机 / 相册 / alert / confirm / prompt）
+
+/// WKWebView 默认什么都不弹：
+/// · <input type="file"> 点了没反应（网页「拍照识别」「从相册导入」全废）
+/// · alert / confirm / prompt 静默返回
+/// 宿主必须实现 WKUIDelegate 才有。页面本身不用改，Safari 里照常能用。
+final class WebUIDelegate: NSObject, WKUIDelegate,
+                          UIImagePickerControllerDelegate, UINavigationControllerDelegate,
+                          PHPickerViewControllerDelegate {
+
+    private var fileCompletion: (([URL]?) -> Void)?
+
+    // MARK: 选图（对应网页的 input[type=file]）
+
+    @available(iOS 18.0, *)
+    func webView(_ webView: WKWebView,
+                 runOpenPanelWith parameters: WKOpenPanelParameters,
+                 initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping ([URL]?) -> Void) {
+        presentPicker(from: webView, completion: completionHandler)
+    }
+
+    /// iOS 15~17 只有私有 selector（自签分发，不涉及审核）
+    @objc(_webView:runOpenPanelWithParameters:initiatedByFrame:completionHandler:)
+    func _webView(_ webView: WKWebView,
+                  runOpenPanelWithParameters parameters: Any,
+                  initiatedByFrame frame: WKFrameInfo,
+                  completionHandler: @escaping ([URL]?) -> Void) {
+        presentPicker(from: webView, completion: completionHandler)
+    }
+
+    private func presentPicker(from webView: WKWebView,
+                               completion: @escaping ([URL]?) -> Void) {
+        guard let host = Self.topViewController(from: webView) else {
+            completion(nil)
+            return
+        }
+        // 上一次没走完的，先当作取消
+        fileCompletion?(nil)
+        fileCompletion = completion
+
+        let sheet = UIAlertController(title: "添加图片", message: nil, preferredStyle: .actionSheet)
+        if UIImagePickerController.isSourceTypeAvailable(.camera) {
+            sheet.addAction(UIAlertAction(title: "拍照", style: .default) { [weak self] _ in
+                self?.openCamera(from: host)
+            })
+        }
+        sheet.addAction(UIAlertAction(title: "从相册选择", style: .default) { [weak self] _ in
+            self?.openLibrary(from: host)
+        })
+        sheet.addAction(UIAlertAction(title: "取消", style: .cancel) { [weak self] _ in
+            self?.finish(nil)
+        })
+        if let pop = sheet.popoverPresentationController {
+            pop.sourceView = host.view
+            pop.sourceRect = CGRect(x: host.view.bounds.midX,
+                                    y: host.view.bounds.midY,
+                                    width: 0, height: 0)
+            pop.permittedArrowDirections = []
+        }
+        host.present(sheet, animated: true)
+    }
+
+    private func openCamera(from host: UIViewController) {
+        guard UIImagePickerController.isSourceTypeAvailable(.camera) else {
+            showAlert("当前设备没有可用相机", from: host)
+            finish(nil)
+            return
+        }
+        // 先要权限，否则直接 present 会黑屏
+        AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                guard granted else {
+                    self.showAlert("没有相机权限，请到 设置 › coco单词默写 里打开「相机」", from: host)
+                    self.finish(nil)
+                    return
+                }
+                let picker = UIImagePickerController()
+                picker.sourceType = .camera
+                picker.cameraCaptureMode = .photo
+                picker.allowsEditing = false
+                picker.delegate = self
+                host.present(picker, animated: true)
+            }
+        }
+    }
+
+    private func openLibrary(from host: UIViewController) {
+        var cfg = PHPickerConfiguration(photoLibrary: .shared())
+        cfg.filter = .images
+        cfg.selectionLimit = 1
+        let picker = PHPickerViewController(configuration: cfg)
+        picker.delegate = self
+        host.present(picker, animated: true)
+    }
+
+    func imagePickerController(_ picker: UIImagePickerController,
+                               didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]) {
+        let image = info[.originalImage] as? UIImage
+        picker.dismiss(animated: true) { [weak self] in
+            self?.finishImage(image)
+        }
+    }
+
+    func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
+        picker.dismiss(animated: true) { [weak self] in
+            self?.finish(nil)
+        }
+    }
+
+    func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+        picker.dismiss(animated: true)
+        guard let provider = results.first?.itemProvider,
+              provider.canLoadObject(ofClass: UIImage.self) else {
+            finish(nil)
+            return
+        }
+        provider.loadObject(ofClass: UIImage.self) { [weak self] object, _ in
+            DispatchQueue.main.async {
+                self?.finishImage(object as? UIImage)
+            }
+        }
+    }
+
+    /// 压到长边 2000 的 JPEG 写临时文件，再把 URL 交还给网页的 input
+    private func finishImage(_ image: UIImage?) {
+        guard let image = image else { return finish(nil) }
+        let maxSide: CGFloat = 2000
+        let longest = max(image.size.width, image.size.height)
+        let scale = longest > maxSide ? maxSide / longest : 1
+        let size = CGSize(width: floor(image.size.width * scale),
+                          height: floor(image.size.height * scale))
+        let renderer = UIGraphicsImageRenderer(size: size)
+        let scaled = renderer.image { _ in
+            image.draw(in: CGRect(origin: .zero, size: size))
+        }
+        guard let data = scaled.jpegData(compressionQuality: 0.88) else {
+            return finish(nil)
+        }
+        let name = "shot-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.prefix(6)).jpg"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        do {
+            try data.write(to: url, options: .atomic)
+            finish([url])
+        } catch {
+            finish(nil)
+        }
+    }
+
+    private func finish(_ urls: [URL]?) {
+        guard let callback = fileCompletion else { return }
+        fileCompletion = nil
+        DispatchQueue.main.async { callback(urls) }
+    }
+
+    // MARK: 网页弹窗
+
+    func webView(_ webView: WKWebView,
+                 runJavaScriptAlertPanelWithMessage message: String,
+                 initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping () -> Void) {
+        guard let host = Self.topViewController(from: webView) else {
+            completionHandler()
+            return
+        }
+        let alert = UIAlertController(title: nil, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "好", style: .default) { _ in completionHandler() })
+        host.present(alert, animated: true)
+    }
+
+    func webView(_ webView: WKWebView,
+                 runJavaScriptConfirmPanelWithMessage message: String,
+                 initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping (Bool) -> Void) {
+        guard let host = Self.topViewController(from: webView) else {
+            completionHandler(false)
+            return
+        }
+        let alert = UIAlertController(title: nil, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in completionHandler(false) })
+        alert.addAction(UIAlertAction(title: "好", style: .default) { _ in completionHandler(true) })
+        host.present(alert, animated: true)
+    }
+
+    func webView(_ webView: WKWebView,
+                 runJavaScriptTextInputPanelWithPrompt prompt: String,
+                 defaultText: String?,
+                 initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping (String?) -> Void) {
+        guard let host = Self.topViewController(from: webView) else {
+            completionHandler(nil)
+            return
+        }
+        let alert = UIAlertController(title: nil, message: prompt, preferredStyle: .alert)
+        alert.addTextField { field in field.text = defaultText }
+        alert.addAction(UIAlertAction(title: "取消", style: .cancel) { _ in completionHandler(nil) })
+        alert.addAction(UIAlertAction(title: "好", style: .default) { _ in
+            completionHandler(alert.textFields?.first?.text)
+        })
+        host.present(alert, animated: true)
+    }
+
+    /// target=_blank / window.open：不新开窗口，交回原页面（返回 nil 不会崩）
+    func webView(_ webView: WKWebView,
+                 createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction,
+                 windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if navigationAction.targetFrame == nil {
+            webView.load(navigationAction.request)
+        }
+        return nil
+    }
+
+    // MARK: 工具
+
+    private func showAlert(_ message: String, from host: UIViewController) {
+        let alert = UIAlertController(title: nil, message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "好", style: .default))
+        host.present(alert, animated: true)
+    }
+
+    private static func topViewController(from webView: WKWebView) -> UIViewController? {
+        var vc = webView.window?.rootViewController
+        while let presented = vc?.presentedViewController {
+            vc = presented
+        }
+        return vc
     }
 }
