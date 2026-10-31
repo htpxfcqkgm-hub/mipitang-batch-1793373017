@@ -801,15 +801,8 @@ final class WebUIDelegate: NSObject, WKUIDelegate,
 
     // MARK: 选图（对应网页的 input[type=file]）
 
-    @available(iOS 18.0, *)
-    func webView(_ webView: WKWebView,
-                 runOpenPanelWith parameters: WKOpenPanelParameters,
-                 initiatedByFrame frame: WKFrameInfo,
-                 completionHandler: @escaping ([URL]?) -> Void) {
-        presentPicker(from: webView, completion: completionHandler)
-    }
-
-    /// iOS 15~17 只有私有 selector（自签分发，不涉及审核）
+    /// 只保留这一个实现：iOS 15~18 的 WKWebView 都是按这个 selector 回调的
+    /// （iOS 18 公开 API 的 ObjC selector 与它同名，两个都写会报重复声明，编译失败）
     @objc(_webView:runOpenPanelWithParameters:initiatedByFrame:completionHandler:)
     func _webView(_ webView: WKWebView,
                   runOpenPanelWithParameters parameters: Any,
